@@ -1,47 +1,63 @@
-import subprocess
+"""Build shell-free launch commands for the dedicated Conda environment."""
+
+from dataclasses import dataclass
 import os
 from pathlib import Path
-from core.settings_manager import load_settings
-from core.kit_template_manager import resolve_template_bat
 
-def launch_isaac_sim(gpu: str = "default", template: str = "Default"):
-    """
-    Launch Isaac Sim using the selected template (display name).
-    - Reads isaac_sim_path & logging_enabled from settings.json
-    - Resolves the exact .bat in: <ISAAC_SIM_PATH>\_build\windows-x86_64\release
-    - Non-blocking, detached launch on Windows
-    """
-    settings = load_settings()
-    isaac_root = Path(settings.get("isaac_sim_path", r"C:\Users\bruni\isaacsim"))
-    logging_enabled = settings.get("logging_enabled", False)
+from core.gpu_bridge_config import GPU
+from core.kit_template_manager import Template, sim_root
+from core.settings_manager import APP_ROOT
 
-    if not isaac_root.exists():
-        raise FileNotFoundError(f"Isaac Sim path not found: {isaac_root}")
 
-    # Resolve the exact .bat path for the chosen template
-    exe_path = resolve_template_bat(template)  # e.g. ...\release\isaac-sim.streaming.bat
-    if not exe_path.exists():
-        raise FileNotFoundError(f"Template launcher not found: {exe_path}")
+@dataclass(frozen=True)
+class LaunchSpec:
+    program: str
+    arguments: list[str]
+    cwd: str
+    environment: dict[str, str]
 
-    # Build command line
-    cmd = [str(exe_path)]
-    if gpu and gpu != "default":
-        cmd.append(f"--gpu={gpu}")
 
-    # Launch detached/no window
-    kwargs = {
-        "cwd": str(exe_path.parent),  # the release folder
-        "creationflags": subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-    }
-
-    # Optional logging
-    if logging_enabled:
-        log_path = Path("isaac_launcher.log")
-        with open(log_path, "a", encoding="utf-8") as log:
-            log.write(f"\n[Launch] {cmd}\n")
-            subprocess.Popen(cmd, stdout=log, stderr=log, **kwargs)
-            log.write("[Status] Isaac Sim launched successfully\n")
+def build_launch(settings: dict, template: Template, gpu: GPU) -> LaunchSpec:
+    prefix = Path(settings["conda_env_path"]).resolve()
+    python = prefix / "python.exe"
+    lab = Path(settings["isaac_lab_path"]).resolve()
+    if not python.is_file():
+        raise FileNotFoundError(f"Conda Python not found: {python}")
+    if not sim_root(settings).is_dir():
+        raise FileNotFoundError("Isaac Sim is not installed in the selected Conda environment.")
+    environment = dict(os.environ)
+    for name in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_PLATFORM"):
+        environment.pop(name, None)
+    environment.update({
+        "CONDA_PREFIX": str(prefix), "CONDA_DEFAULT_ENV": prefix.name,
+        "UV_PROJECT_ENVIRONMENT": str(prefix), "UV_PYTHON_PREFERENCE": "only-system",
+        "OMNI_KIT_ACCEPT_EULA": "YES", "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8",
+        "CUDA_VISIBLE_DEVICES": gpu.uuid,
+        "PATH": os.pathsep.join([str(prefix), str(prefix / "Scripts"), str(prefix / "Library/bin"), environment.get("PATH", "")]),
+    })
+    gpu_flags = ["--/renderer/multiGpu/enabled=false", "--/renderer/multiGpu/activeCudaGpus=0,", "--/physics/cudaDevice=0"]
+    arguments = ["-u", str(APP_ROOT / "core/run_isaac.py"), template.kind]
+    headless = bool(settings["headless"]) or template.requires_headless
+    if template.kind == "sim":
+        if not (sim_root(settings) / "apps" / template.key).is_file():
+            raise FileNotFoundError(f"Installed template is missing: {template.key}")
+        arguments += [template.key, *gpu_flags]
+        if headless:
+            arguments.append("--no-window")
+        cwd = sim_root(settings)
     else:
-        subprocess.Popen(cmd, **kwargs)
-
-    print(f"✅ Launched: {exe_path.name}  (GPU: {gpu})")
+        if not (lab / "isaaclab.bat").is_file():
+            raise FileNotFoundError(f"Isaac Lab checkout not found: {lab}")
+        count, iterations = int(settings["num_envs"]), int(settings["iterations"])
+        if not 1 <= count <= 4096 or not 1 <= iterations <= 100000:
+            raise ValueError("Environment count or iteration count is outside the supported range.")
+        arguments += [
+            "train", "--rl_library", "rsl_rl", "--task", "Isaac-Cartpole-Direct",
+            "--num_envs", str(count), "--max_iterations", str(iterations),
+            "--device", "cuda:0", "--logger", "tensorboard", "--run_name", "launcher",
+            "physics=isaacsim_physx", "--kit_args=" + " ".join(gpu_flags),
+        ]
+        if not headless:
+            arguments += ["--visualizer", "kit"]
+        cwd = lab
+    return LaunchSpec(str(python), arguments, str(cwd), environment)

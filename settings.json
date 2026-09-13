@@ -1,4 +1,3 @@
 {
-    "isaac_sim_path": "C:",
-    "logging_enabled": false
+  "note": "Preferences are stored per user in %LOCALAPPDATA%/NeuroIntent/IsaacLauncher/settings.json. Use Settings in the launcher."
 }
